@@ -21,10 +21,18 @@ final class DeviceStat: @unchecked Sendable {
     }
 
     private func updateGPUUsages() {
-        let gpuSnapshotDelta = initialGPUSnapshot.delta(GPU.snapshot())
+        let currentSnapshot = GPU.snapshot()
+        let gpuSnapshotDelta = initialGPUSnapshot.delta(currentSnapshot)
+        
+        // Ensure we don't have NaN or infinite values
+        let safeDelta = GPU.Snapshot(
+            activeMemory: gpuSnapshotDelta.activeMemory.isNaN || gpuSnapshotDelta.activeMemory.isInfinite ? 0 : max(0, gpuSnapshotDelta.activeMemory),
+            cacheMemory: gpuSnapshotDelta.cacheMemory.isNaN || gpuSnapshotDelta.cacheMemory.isInfinite ? 0 : max(0, gpuSnapshotDelta.cacheMemory),
+            peakMemory: gpuSnapshotDelta.peakMemory.isNaN || gpuSnapshotDelta.peakMemory.isInfinite ? 0 : max(0, gpuSnapshotDelta.peakMemory)
+        )
+        
         DispatchQueue.main.async { [weak self] in
-            self?.gpuUsage = gpuSnapshotDelta
+            self?.gpuUsage = safeDelta
         }
     }
-
 }

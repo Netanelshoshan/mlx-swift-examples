@@ -179,9 +179,19 @@ struct GenerateArguments: ParsableArguments, Sendable {
         input: LMInput, context: ModelContext
     ) async throws -> (GenerateCompletionInfo, String) {
         var output = ""
-        for await item in try MLXLMCommon.generate(
-            input: input, parameters: generateParameters, context: context)
-        {
+        
+        // Use memory-optimized generation with monitoring
+        let stream = MemoryOptimization.generateWithMemoryMonitoring(
+            input: input,
+            parameters: generateParameters,
+            context: context,
+            monitorInterval: 25
+        ) {
+            // Memory pressure callback - force cleanup
+            MemoryOptimization.forceMemoryCleanup()
+        }
+        
+        for await item in stream {
             switch item {
             case .chunk(let string):
                 output += string
@@ -196,7 +206,7 @@ struct GenerateArguments: ParsableArguments, Sendable {
     }
 }
 
-/// Argument package for adjusting and reporting memory use.
+/// Argument package for adjusting and reporting memory use with advanced optimization.
 struct MemoryArguments: ParsableArguments, Sendable {
 
     @Flag(name: .long, help: "Show memory stats")
@@ -208,15 +218,39 @@ struct MemoryArguments: ParsableArguments, Sendable {
     @Option(name: .long, help: "Maximum memory size in M")
     var memorySize: Int?
 
+    @Option(name: .long, help: "Memory optimization strategy")
+    var optimizationStrategy: String = "balanced"
+
+    @Flag(name: .long, help: "Enable adaptive memory management")
+    var adaptiveMemory = true
+
+    @Flag(name: .long, help: "Enable memory monitoring during generation")
+    var memoryMonitoring = true
+
     var startMemory: GPU.Snapshot?
 
     mutating func start<L>(_ load: @Sendable () async throws -> L) async throws -> L {
-        if let cacheSize {
-            GPU.set(cacheLimit: cacheSize * 1024 * 1024)
-        }
+        // Set memory limits based on strategy
+        let strategy: MemoryOptimization.OptimizationStrategy = {
+            switch optimizationStrategy.lowercased() {
+            case "aggressive": return .aggressive
+            case "conservative": return .conservative
+            default: return .balanced
+            }
+        }()
+        
+        if adaptiveMemory {
+            // Use adaptive memory management
+            MemoryOptimization.setAdaptiveMemoryLimits(strategy: strategy)
+        } else {
+            // Use manual memory limits
+            if let cacheSize {
+                GPU.set(cacheLimit: cacheSize * 1024 * 1024)
+            }
 
-        if let memorySize {
-            GPU.set(memoryLimit: memorySize * 1024 * 1024)
+            if let memorySize {
+                GPU.set(memoryLimit: memorySize * 1024 * 1024)
+            }
         }
 
         let result = try await load()
@@ -226,12 +260,24 @@ struct MemoryArguments: ParsableArguments, Sendable {
     }
 
     mutating func start() {
-        if let cacheSize {
-            GPU.set(cacheLimit: cacheSize * 1024 * 1024)
-        }
+        let strategy: MemoryOptimization.OptimizationStrategy = {
+            switch optimizationStrategy.lowercased() {
+            case "aggressive": return .aggressive
+            case "conservative": return .conservative
+            default: return .balanced
+            }
+        }()
+        
+        if adaptiveMemory {
+            MemoryOptimization.setAdaptiveMemoryLimits(strategy: strategy)
+        } else {
+            if let cacheSize {
+                GPU.set(cacheLimit: cacheSize * 1024 * 1024)
+            }
 
-        if let memorySize {
-            GPU.set(memoryLimit: memorySize * 1024 * 1024)
+            if let memorySize {
+                GPU.set(memoryLimit: memorySize * 1024 * 1024)
+            }
         }
 
         startMemory = GPU.snapshot()
@@ -240,33 +286,56 @@ struct MemoryArguments: ParsableArguments, Sendable {
     func reportCurrent() {
         if memoryStats {
             let memory = GPU.snapshot()
-            print(memory.description)
+            let state = MemoryOptimization.getMemoryState()
+            print("Memory Usage:")
+            print("  Active: \(state.activeMemory.formatted(.byteCount(style: .memory)))")
+            print("  Cache: \(state.cacheMemory.formatted(.byteCount(style: .memory)))")
+            print("  Peak: \(state.peakMemory.formatted(.byteCount(style: .memory)))")
+            print("  Pressure: \(state.pressure)")
+            print("  Usage Ratio: \(String(format: "%.1f%%", state.memoryUsageRatio * 100))")
         }
     }
 
     func reportMemoryStatistics() {
         if memoryStats, let startMemory {
             let endMemory = GPU.snapshot()
+            let state = MemoryOptimization.getMemoryState()
 
             print("=======")
-            print("Memory size: \(GPU.memoryLimit / 1024)K")
-            print("Cache size:  \(GPU.cacheLimit / 1024)K")
+            print("Memory Configuration:")
+            print("  Memory Limit: \(state.memoryLimit.formatted(.byteCount(style: .memory)))")
+            print("  Cache Limit: \(state.cacheLimit.formatted(.byteCount(style: .memory)))")
+            print("  Strategy: \(optimizationStrategy)")
+            print("  Adaptive: \(adaptiveMemory)")
 
             print("")
             print("=======")
-            print("Starting memory")
-            print(startMemory.description)
+            print("Starting Memory State:")
+            print("  Active: \(startMemory.activeMemory.formatted(.byteCount(style: .memory)))")
+            print("  Cache: \(startMemory.cacheMemory.formatted(.byteCount(style: .memory)))")
+            print("  Peak: \(startMemory.peakMemory.formatted(.byteCount(style: .memory)))")
 
             print("")
             print("=======")
-            print("Ending memory")
-            print(endMemory.description)
+            print("Ending Memory State:")
+            print("  Active: \(endMemory.activeMemory.formatted(.byteCount(style: .memory)))")
+            print("  Cache: \(endMemory.cacheMemory.formatted(.byteCount(style: .memory)))")
+            print("  Peak: \(endMemory.peakMemory.formatted(.byteCount(style: .memory)))")
 
             print("")
             print("=======")
-            print("Growth")
-            print(startMemory.delta(endMemory).description)
+            print("Memory Growth:")
+            let delta = startMemory.delta(endMemory)
+            print("  Active: \(delta.activeMemory.formatted(.byteCount(style: .memory)))")
+            print("  Cache: \(delta.cacheMemory.formatted(.byteCount(style: .memory)))")
+            print("  Peak: \(delta.peakMemory.formatted(.byteCount(style: .memory)))")
 
+            print("")
+            print("=======")
+            print("Current Memory Pressure:")
+            print("  Level: \(state.pressure)")
+            print("  Usage Ratio: \(String(format: "%.1f%%", state.memoryUsageRatio * 100))")
+            print("  Cache Ratio: \(String(format: "%.1f%%", state.cacheUsageRatio * 100))")
         }
     }
 }

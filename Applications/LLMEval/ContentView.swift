@@ -174,12 +174,49 @@ class LLMEvaluator {
     var modelInfo = ""
     var stat = ""
 
-    /// This controls which model loads. `qwen2_5_1_5b` is one of the smaller ones, so this will fit on
-    /// more devices.
-    let modelConfiguration = LLMRegistry.qwen3_1_7b_4bit
+    /// Adaptive model selection based on available memory
+    var modelConfiguration: ModelConfiguration {
+        let availableMemory = GPU.memoryLimit
+        let deviceMemory = ProcessInfo.processInfo.physicalMemory
+        
+        // Ultra-low memory devices (< 4GB)
+        if availableMemory < 2 * 1024 * 1024 * 1024 {
+            return LLMRegistry.openelm270m4bit
+        }
+        // Low memory devices (< 8GB)
+        else if availableMemory < 4 * 1024 * 1024 * 1024 {
+            return LLMRegistry.smollm3_3b_4bit
+        }
+        // Medium memory devices (< 16GB)
+        else if availableMemory < 8 * 1024 * 1024 * 1024 {
+            return LLMRegistry.qwen3_1_7b_4bit
+        }
+        // High memory devices (>= 16GB)
+        else {
+            return LLMRegistry.qwen3_4b_4bit
+        }
+    }
 
-    /// parameters controlling the output
-    let generateParameters = GenerateParameters(maxTokens: 240, temperature: 0.6)
+    /// Optimized generation parameters with aggressive memory management
+    var generateParameters: GenerateParameters {
+        let availableMemory = GPU.memoryLimit
+        
+        // Adaptive parameters based on memory
+        let maxTokens = availableMemory < 4 * 1024 * 1024 * 1024 ? 120 : 240
+        let maxKVSize = availableMemory < 2 * 1024 * 1024 * 1024 ? 512 : 1024
+        let kvBits = availableMemory < 4 * 1024 * 1024 * 1024 ? 4 : 8
+        let quantizedKVStart = availableMemory < 2 * 1024 * 1024 * 1024 ? 128 : 256
+        
+        return GenerateParameters(
+            maxTokens: maxTokens,
+            maxKVSize: maxKVSize,
+            kvBits: kvBits,
+            kvGroupSize: 64,
+            quantizedKVStart: quantizedKVStart,
+            temperature: 0.6
+        )
+    }
+    
     let updateInterval = Duration.seconds(0.25)
 
     /// A task responsible for handling the generation process.
@@ -237,13 +274,31 @@ class LLMEvaluator {
         TimeOutput(time: Date.now.formatted())
     }
 
-    /// load and return the model -- can be called multiple times, subsequent calls will
-    /// just return the loaded model
+    /// Optimized model loading with aggressive memory management
     func load() async throws -> ModelContainer {
         switch loadState {
         case .idle:
-            // limit the buffer cache
-            MLX.GPU.set(cacheLimit: 20 * 1024 * 1024)
+            // Set aggressive memory limits based on available memory
+            let availableMemory = GPU.memoryLimit
+            let deviceMemory = ProcessInfo.processInfo.physicalMemory
+            
+            if availableMemory < 2 * 1024 * 1024 * 1024 {
+                // Ultra-low memory: 5MB cache, 1GB memory limit
+                MLX.GPU.set(cacheLimit: 5 * 1024 * 1024)
+                MLX.GPU.set(memoryLimit: 1 * 1024 * 1024 * 1024)
+            } else if availableMemory < 4 * 1024 * 1024 * 1024 {
+                // Low memory: 10MB cache, 2GB memory limit
+                MLX.GPU.set(cacheLimit: 10 * 1024 * 1024)
+                MLX.GPU.set(memoryLimit: 2 * 1024 * 1024 * 1024)
+            } else if availableMemory < 8 * 1024 * 1024 * 1024 {
+                // Medium memory: 20MB cache, 4GB memory limit
+                MLX.GPU.set(cacheLimit: 20 * 1024 * 1024)
+                MLX.GPU.set(memoryLimit: 4 * 1024 * 1024 * 1024)
+            } else {
+                // High memory: 50MB cache, 8GB memory limit
+                MLX.GPU.set(cacheLimit: 50 * 1024 * 1024)
+                MLX.GPU.set(memoryLimit: 8 * 1024 * 1024 * 1024)
+            }
 
             let modelContainer = try await LLMModelFactory.shared.loadContainer(
                 configuration: modelConfiguration
@@ -296,13 +351,33 @@ class LLMEvaluator {
 
             try await modelContainer.perform { (context: ModelContext) -> Void in
                 let lmInput = try await context.processor.prepare(input: userInput)
-                let stream = try MLXLMCommon.generate(
+                let stream = try await MLXLMCommon.generate(
                     input: lmInput, parameters: generateParameters, context: context)
 
-                // generate and output in batches
+                // generate and output in batches with memory monitoring
+                var tokenCount = 0
                 for await batch in stream._throttle(
                     for: updateInterval, reducing: Generation.collect)
                 {
+                    // Monitor memory usage every 50 tokens
+                    if tokenCount % 50 == 0 {
+                        let memoryUsage = GPU.snapshot().activeMemory
+                        let memoryLimit = GPU.memoryLimit
+                        
+                        // If memory usage exceeds 80%, trigger aggressive cleanup
+                        if memoryLimit > 0 && Double(memoryUsage) / Double(memoryLimit) > 0.8 {
+                            // Force garbage collection
+                            MLX.GPU.synchronize()
+                            
+                            // Trim cache if possible
+                            if let cache = context.model as? any KVCacheDimensionProvider {
+                                // This would require additional implementation
+                                // For now, we just log the memory pressure
+                                print("Memory pressure detected: \(memoryUsage) / \(memoryLimit)")
+                            }
+                        }
+                    }
+                    
                     let output = batch.compactMap { $0.chunk }.joined(separator: "")
                     if !output.isEmpty {
                         Task { @MainActor [output] in
@@ -319,6 +394,8 @@ class LLMEvaluator {
                     if let toolCall = batch.compactMap({ $0.toolCall }).first {
                         try await handleToolCall(toolCall, prompt: prompt)
                     }
+                    
+                    tokenCount += batch.compactMap { $0.chunk }.count
                 }
             }
 

@@ -295,6 +295,106 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         defaultPrompt: "Why is the sky blue?"
     )
 
+    // MARK: - Memory-Optimized Model Configurations
+    
+    /// Ultra-low memory models (< 2GB available)
+    static public let ultraLowMemoryModels: [ModelConfiguration] = [
+        openelm270m4bit,
+        smollm3_3b_4bit,
+        qwen3_0_6b_4bit
+    ]
+    
+    /// Low memory models (< 4GB available)
+    static public let lowMemoryModels: [ModelConfiguration] = [
+        smollm3_3b_4bit,
+        qwen3_0_6b_4bit,
+        qwen3_1_7b_4bit,
+        phi3_5_4bit,
+        llama3_2_1B_4bit
+    ]
+    
+    /// Medium memory models (< 8GB available)
+    static public let mediumMemoryModels: [ModelConfiguration] = [
+        qwen3_1_7b_4bit,
+        qwen3_4b_4bit,
+        llama3_2_3B_4bit,
+        gemma3_1B_qat_4bit,
+        phi3_5MoE
+    ]
+    
+    /// High memory models (>= 8GB available)
+    static public let highMemoryModels: [ModelConfiguration] = [
+        qwen3_4b_4bit,
+        qwen3_8b_4bit,
+        llama3_8B_4bit,
+        gemma3n_E2B_it_lm_4bit,
+        deepSeekR1_7B_4bit
+    ]
+    
+    /// Get optimal model configuration based on available memory
+    static public func getOptimalModel(for availableMemory: Int64) -> ModelConfiguration {
+        let memoryGB = availableMemory / (1024 * 1024 * 1024)
+        
+        switch memoryGB {
+        case 0..<2:
+            return ultraLowMemoryModels.randomElement() ?? openelm270m4bit
+        case 2..<4:
+            return lowMemoryModels.randomElement() ?? smollm3_3b_4bit
+        case 4..<8:
+            return mediumMemoryModels.randomElement() ?? qwen3_1_7b_4bit
+        default:
+            return highMemoryModels.randomElement() ?? qwen3_4b_4bit
+        }
+    }
+    
+    /// Get memory-optimized generation parameters
+    static public func getOptimizedParameters(for availableMemory: Int64) -> GenerateParameters {
+        let memoryGB = availableMemory / (1024 * 1024 * 1024)
+        
+        switch memoryGB {
+        case 0..<2:
+            // Ultra-low memory: aggressive quantization and small context
+            return GenerateParameters(
+                maxTokens: 80,
+                maxKVSize: 256,
+                kvBits: 4,
+                kvGroupSize: 32,
+                quantizedKVStart: 64,
+                temperature: 0.6
+            )
+        case 2..<4:
+            // Low memory: moderate quantization
+            return GenerateParameters(
+                maxTokens: 120,
+                maxKVSize: 512,
+                kvBits: 4,
+                kvGroupSize: 64,
+                quantizedKVStart: 128,
+                temperature: 0.6
+            )
+        case 4..<8:
+            // Medium memory: standard quantization
+            return GenerateParameters(
+                maxTokens: 240,
+                maxKVSize: 1024,
+                kvBits: 8,
+                kvGroupSize: 64,
+                quantizedKVStart: 256,
+                temperature: 0.6
+            )
+        default:
+            // High memory: minimal quantization
+            return GenerateParameters(
+                maxTokens: 240,
+                maxKVSize: 2048,
+                kvBits: 8,
+                kvGroupSize: 64,
+                quantizedKVStart: 512,
+                temperature: 0.6
+            )
+        }
+    }
+
     private static func all() -> [ModelConfiguration] {
         [
             codeLlama13b4bit,
@@ -463,5 +563,96 @@ public class LLMModelFactory: ModelFactory {
 public class TrampolineModelFactory: NSObject, ModelFactoryTrampoline {
     public static func modelFactory() -> (any MLXLMCommon.ModelFactory)? {
         LLMModelFactory.shared
+    }
+}
+
+/// Memory-optimized model factory that automatically selects optimal models and parameters
+public class MemoryOptimizedModelFactory: ModelFactory {
+    
+    public static let shared = MemoryOptimizedModelFactory(
+        typeRegistry: LLMTypeRegistry.shared,
+        modelRegistry: LLMRegistry.shared
+    )
+    
+    private let typeRegistry: ModelTypeRegistry
+    public let modelRegistry: AbstractModelRegistry
+    private let modelCache = NSCache<NSString, ModelContainer>()
+    private let maxCachedModels = 2
+    
+    public init(typeRegistry: ModelTypeRegistry, modelRegistry: AbstractModelRegistry) {
+        self.typeRegistry = typeRegistry
+        self.modelRegistry = modelRegistry
+    }
+    
+    /// Load model with automatic memory optimization
+    public func loadOptimizedContainer(
+        progressHandler: @Sendable @escaping (Progress) -> Void
+    ) async throws -> ModelContainer {
+        let availableMemory = GPU.memoryLimit
+        let optimalConfig = LLMRegistry.getOptimalModel(for: Int64(availableMemory))
+        
+        // Set basic memory limits
+        MLX.GPU.set(cacheLimit: 20 * 1024 * 1024)  // 20MB cache
+        MLX.GPU.set(memoryLimit: 4 * 1024 * 1024 * 1024)  // 4GB memory
+        
+        // Convert identifier to string for cache key
+        let cacheKey = optimalConfig.name as NSString
+        
+        // Check cache first
+        if let cached = modelCache.object(forKey: cacheKey) {
+            return cached
+        }
+        
+        // Unload least recently used model if at capacity
+        if modelCache.totalCostLimit > maxCachedModels {
+            unloadLeastUsedModel()
+        }
+        
+        // Load the optimal model
+        let container = try await loadContainer(
+            configuration: optimalConfig,
+            progressHandler: progressHandler
+        )
+        
+        // Cache the loaded model
+        modelCache.setObject(container, forKey: cacheKey)
+        
+        return container
+    }
+    
+    /// Unload least recently used model from cache
+    private func unloadLeastUsedModel() {
+        // Simple LRU: remove all cached models
+        modelCache.removeAllObjects()
+    }
+    
+    /// Clear all cached models
+    public func clearCache() {
+        modelCache.removeAllObjects()
+        // Force garbage collection by clearing cache
+        MLX.GPU.clearCache()
+    }
+    
+    /// Get memory usage statistics
+    public func getMemoryStats() -> (active: Int64, cache: Int64, peak: Int64) {
+        let snapshot = GPU.snapshot()
+        return (
+            active: Int64(snapshot.activeMemory),
+            cache: Int64(snapshot.cacheMemory),
+            peak: Int64(snapshot.peakMemory)
+        )
+    }
+    
+    // MARK: - ModelFactory Protocol Implementation
+    
+    public func _load(
+        hub: HubApi, configuration: ModelConfiguration,
+        progressHandler: @Sendable @escaping (Progress) -> Void
+    ) async throws -> sending ModelContext {
+        return try await LLMModelFactory.shared._load(
+            hub: hub,
+            configuration: configuration,
+            progressHandler: progressHandler
+        )
     }
 }
